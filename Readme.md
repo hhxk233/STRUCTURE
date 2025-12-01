@@ -1,16 +1,10 @@
-# With Limited Data for Multimodal Alignment, Let the STRUCTURE Guide You
-
-<div align="center">
-
-### [NeurIPS 2025]
+# [NeurIPS 2025] With Limited Data for Multimodal Alignment, Let the STRUCTURE Guide You 
 
 [![Paper](https://img.shields.io/badge/arXiv-2506.16895-b31b1b.svg)](https://arxiv.org/abs/2506.16895)
 [![OpenReview](https://img.shields.io/badge/OpenReview-IkvQqD7hk3-8c1b13.svg)](https://openreview.net/forum?id=IkvQqD7hk3)
 [![Project Page](https://img.shields.io/badge/Project-Page-blue)](https://brbiclab.epfl.ch/projects/structure/)
 
-**[Fabian Gröger](https://fabiangroeger.com/)** · **[Shuo Wen](https://wenshuo128.github.io/)** · **[Huyen Le](https://people.epfl.ch/thao.le)** · **[Maria Brbić](https://brbiclab.epfl.ch/team/)**
-
-</div>
+**[Fabian Gröger](https://fabiangroeger96.github.io/)** · **[Shuo Wen](https://wenshuo128.github.io/)** · **[Huyen Le](https://people.epfl.ch/thao.le)** · **[Maria Brbić](https://brbiclab.epfl.ch/team/)**
 
 ---
 
