@@ -1,0 +1,15 @@
+defaults: !include ../default.yaml
+
+overrides:
+    training:
+        cca: true
+        cca_kwargs:
+            sim_dim: 512
+            equal_weights: False
+            use_reg: True
+            lambda_rs: 10.0
+            lambda_cca_coeff: 1.0e-2
+            L: 1
+            tau: 0.2
+            refine_epochs: 10
+            lr: 5.0e-4

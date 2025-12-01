@@ -1,0 +1,25 @@
+[project]
+name = "STRUCTURE"
+description = "Source code for the NeurIPS'25 paper: ``With Limited Data for Multimodal Alignment, Let the STRUCTURE Guide You'''"
+authors = [
+    { name = "Fabian Gröger", email = "fabian.groeger@unibas.ch" },
+    { name = "Shuo Wen", email = "shuo.wen@epfl.ch" },
+    { name = "Huyen Le"},
+    { name = "Maria Brbic", email = "mbrbic@epfl.ch" },
+]
+
+[tool.black]
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+skip_gitignore=true
+py_version=39
+default_section = "THIRDPARTY"
+known_thirdparty=["wandb"]
+
+[tool.pytest.ini_options]
+# Set true to see logger ouput in test command line window
+log_cli = false
+log_cli_level = "INFO"
+log_cli_format = "%(time)s :: %(name)s :: %(message)s"

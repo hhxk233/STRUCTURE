@@ -1,0 +1,16 @@
+defaults: !include ../default.yaml
+
+overrides:
+    training:
+        alignment_layer_name: "LinearAlignmentLayer"
+        alignment_layer_kwargs:
+            dim_alignment: 512
+
+    layer_selection:
+        type: "random"
+        n_samples: 5_000
+        metric: "mutual_knn"
+        metric_kwargs:
+            topk: 50
+            normalize: true
+        best_only: true

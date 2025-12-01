@@ -1,0 +1,16 @@
+defaults: !include ../default.yaml
+
+overrides:
+    training:
+        alignment_layer_name: "LinearAlignmentLayer"
+        alignment_layer_kwargs:
+            dim_alignment: 512
+
+        clip_loss_name: "CLIPLoss"
+        clip_loss:
+            temperature: 0.05
+            structure_lambda: 0
+
+    layer_selection:
+        best_only: false
+        last_only: true

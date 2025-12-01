@@ -1,0 +1,21 @@
+defaults: !include ../default.yaml
+
+overrides:
+    training:
+        alignment_layer_name: "ResLowRankHead"
+        alignment_layer_kwargs:
+            dim_alignment: 512
+            rank: 64
+            dropout_p: 0.1
+            gate_init: 0.0
+
+        clip_loss_name: "CLIPLoss"
+        clip_loss:
+            temperature: 0.05
+            normalize_latents: true
+
+            warmup_steps: 1000
+            structure_lambda: 10.0
+            structure_levels: 5
+            structure_margin: 0.0
+            structure_weighting: "inverse"

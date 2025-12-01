@@ -1,0 +1,9 @@
+defaults: !include ../default.yaml
+
+overrides:
+    training:
+        clip: true
+
+    alignment:
+        llm_model_name: "openai/clip-vit-large-patch14-336"
+        lvm_model_name: "openai/clip-vit-large-patch14-336"

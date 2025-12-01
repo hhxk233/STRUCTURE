@@ -1,0 +1,155 @@
+random_state: 42
+
+paths:
+    data_path: "./data"
+    save_path: "./results"
+
+features:
+    modelset: "val" # val, test
+    modality: "all" # vision, language, all
+
+    pool_img: "cls"
+    pool_txt: "avg" # last, avg
+
+    dataset: "coco"
+    label_templates:
+        - "a photo of a {label}"
+    template_key: "label"
+    precompute_captions: true
+
+    num_workers: 8
+    batch_size: 16
+
+alignment:
+    llm_model_name: "sentence-transformers/all-roberta-large-v1"
+    lvm_model_name: "vit_large_patch14_dinov2.lvd142m"
+
+layer_selection:
+    type: "random"
+    n_samples: 5_000
+    metric: "mutual_knn"
+    metric_kwargs:
+        topk: "rice"
+        normalize: true
+    n_score_bins: 5
+    best_only: true
+    last_only: false
+    n_last_layers: null
+
+training:
+    n_epochs: 1000
+    batch_size: 4096
+
+    learning_rate: &lr 1.0e-3 # 3e-5, 8.0e-4
+    use_lr_finder: true
+    lr_finder:
+        num_iter: 100
+        start_lr: 1.0e-7
+        end_lr: 10
+
+    # ABLATION PARAMS
+    mixup_alpha: 0.0 # if > 0.0 then it uses FuseMix
+    fixed_structure: false
+
+    clip_grad: 1.0
+    early_stopping: true
+    early_stopping_patience: 200
+
+    drop_duplicates: true
+    n_dup_samples: 1
+
+    wandb_watch: false
+    embedding_visualization: 500
+    visualize_original_embeddings: false
+    log_structural_preservation: false
+    structural_preservation_k:
+        - 100
+        - 1_000
+
+    unimodal_data:
+        use: false
+        text:
+            - "flickr30"
+        image:
+            - "stl10"
+
+    # will be overwritten in the specific yamls
+    alignment_layer_name: "LinearAlignmentLayer"
+    alignment_layer_kwargs:
+        dim_alignment: 256
+
+    clip_loss_name: "CLIPLoss"
+    clip_loss:
+        temperature: 0.05
+        normalize_latents: true
+
+        warmup_steps: 1000
+        structure_lambda: 10.0
+        structure_levels: 1
+        structure_margin: 0.0
+        structure_weighting: "none"
+
+    optimizer_name: "AdamW"
+    optimizer_kwargs:
+        betas: [0.9, 0.95]
+        weight_decay: 1.0e-4 # 3e-7
+
+    scheduler_name: "CosineAnnealingLR"
+    scheduler_kwargs:
+        warmup_min_lr: 0.0
+        warmup_max_lr: *lr
+        warmup_num_steps: 10_000
+    scheduler_epoch_cycles: 50
+
+evaluation:
+    batch_size: 256
+    num_workers: 8
+    num_classes_per_batch: 2
+    use_extended_prompts: true
+    sample_by_sample_embedding: false
+
+    # further insights
+    plot_embedding_space: false
+    log_structural_preservation: false
+    structural_preservation_k:
+        - 100
+        - 1_000
+
+    drop_duplicates: false
+
+    zero_shot_datasets:
+        # Coarse concepts (e.g. ships, planes)
+        - "stl10"
+        - "caltech101"
+        - "food101"
+        - "cifar10"
+        - "cifar100"
+        - "imagenet"
+        - "ucf101"
+        - "kinetics700"
+        - "sun397"
+        - "eurosat"
+        - "resisc45"
+        - "mnist"
+        - "dtd"
+
+        # Exotic concepts (e.g. emotions, counting)
+        - "gtsrb"
+        - "hatefulmemes"
+        - "sst"
+        - "kitti"
+        - "country211"
+        - "fer2013"
+        - "clevr"
+
+        # Specific concepts (e.g. species of birds)
+        - "pcam"
+        - "birdsnap"
+        - "cars"
+        - "aircraft"
+        - "pets"
+        - "flowers"
+
+    retrieval_datasets:
+        - "flickr30"
+        - "coco"

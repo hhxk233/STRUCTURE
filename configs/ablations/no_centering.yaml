@@ -1,0 +1,19 @@
+defaults: !include ../default.yaml
+
+overrides:
+    training:
+        alignment_layer_name: "LinearAlignmentLayer"
+        alignment_layer_kwargs:
+            dim_alignment: 512
+
+        clip_loss_name: "CLIPLoss"
+        clip_loss:
+            temperature: 0.05
+            normalize_latents: true
+
+            warmup_steps: 1000
+            structure_lambda: 10.0
+            structure_levels: 1
+            structure_margin: 0.0
+            structure_weighting: "none"
+            structure_centering: "none"

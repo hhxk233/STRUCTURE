@@ -1,0 +1,13 @@
+defaults: !include ../default.yaml
+
+overrides:
+    training:
+        cca: true
+        cca_kwargs:
+            sim_dim: 512
+            equal_weights: False
+            use_reg: False
+
+    layer_selection:
+        best_only: true
+        last_only: false
