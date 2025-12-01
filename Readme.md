@@ -4,7 +4,7 @@
 [![OpenReview](https://img.shields.io/badge/OpenReview-IkvQqD7hk3-8c1b13.svg)](https://openreview.net/forum?id=IkvQqD7hk3)
 [![Project Page](https://img.shields.io/badge/Project-Page-blue)](https://brbiclab.epfl.ch/projects/structure/)
 
-**[Fabian Gröger](https://fabiangroeger96.github.io/)** · **[Shuo Wen](https://wenshuo128.github.io/)** · **[Huyen Le](https://people.epfl.ch/thao.le)** · **[Maria Brbić](https://brbiclab.epfl.ch/team/)**
+**[Fabian Gröger*](https://fabiangroeger96.github.io/)** · **[Shuo Wen*](https://wenshuo128.github.io/)** · **[Huyen Le](https://people.epfl.ch/thao.le)** · **[Maria Brbić](https://brbiclab.epfl.ch/team/)**
 
 ---
 
