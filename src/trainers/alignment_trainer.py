@@ -16,10 +16,12 @@ from deepspeed.runtime.lr_schedules import WarmupDecayLR, WarmupLR
 from loguru import logger
 from timm.data import resolve_data_config
 from timm.data.transforms_factory import create_transform
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchinfo import summary
+import torchvision.transforms as transforms
 from torchvision.models.feature_extraction import create_feature_extractor
 from tqdm import tqdm, trange
+from transformers import AutoImageProcessor, AutoModel
 
 from src.alignment.alignment_factory import AlignmentFactory
 from src.core.src.datasets.downstream_tasks.coco_dataset import LoadingType
@@ -35,6 +37,11 @@ from src.evaluation.consts import (
     DATASETS_TO_CLASSES,
     DATASETS_TO_TEMPLATES,
     SIMPLE_PROMPT_TEMPLATE,
+)
+from src.evaluation.alignment_metrics import (
+    compute_cross_modal_purity_score,
+    compute_purity_score,
+    compute_silhouette_score,
 )
 from src.evaluation.retrieval import retrieval_metrics_df
 from src.evaluation.zero_shot_classifier import (
@@ -82,6 +89,16 @@ class AlignmentTrainer(Trainer):
             wandb_project_name=wandb_project_name,
             wandb_notes=wandb_notes,
         )
+        save_cfg = self.config["evaluation"].get("save_embeddings", {})
+        if isinstance(save_cfg, bool):
+            self.save_embeddings_enabled = save_cfg
+            self.save_embeddings_top_k = 0
+            self.save_embeddings_datasets = None
+        else:
+            self.save_embeddings_enabled = save_cfg.get("enabled", False)
+            self.save_embeddings_top_k = save_cfg.get("top_k", 0)
+            self.save_embeddings_datasets = save_cfg.get("datasets")
+        self.save_embedding_layer_combinations = None
         self.cache_features = cache_features
         self.print_model_summary = print_model_summary
         self.save_path = Path(config["paths"]["save_path"])
@@ -102,7 +119,8 @@ class AlignmentTrainer(Trainer):
 
         # make sure that our experiment folder is there
         (self.save_path / self.exp_name).mkdir(parents=True, exist_ok=True)
-        (self.save_path / wandb.run.name).mkdir(parents=True, exist_ok=True)
+        run_name = wandb.run.name if wandb.run is not None else "offline"
+        (self.save_path / run_name).mkdir(parents=True, exist_ok=True)
 
     def __del__(self):
         # do garbage collection
@@ -119,6 +137,26 @@ class AlignmentTrainer(Trainer):
     ):
         m_name = AlignmentTrainer.get_model_name(m_name=m_name)
         return save_path / "features" / f"{m_name}-{d_name}-{suffix}.npy"
+
+    @staticmethod
+    def build_dataset_tag(dataset, dataset_name: str, dataset_size: Optional[int] = None):
+        parts = [dataset_name]
+        if hasattr(dataset, "annotation_file"):
+            parts.append(Path(dataset.annotation_file).stem)
+        if hasattr(dataset, "meta_path"):
+            parts.append(Path(dataset.meta_path).stem)
+        if hasattr(dataset, "root_dir"):
+            parts.append(Path(dataset.root_dir).name)
+        if hasattr(dataset, "image_dir"):
+            parts.append(Path(dataset.image_dir).name)
+        if dataset_size is None:
+            try:
+                dataset_size = len(dataset)
+            except Exception:
+                dataset_size = None
+        if dataset_size is not None:
+            parts.append(f"n{dataset_size}")
+        return "-".join(parts)
 
     def add_exp_suffix_to_name(self, base_name: str):
         save_name = f"{base_name}"
@@ -139,6 +177,61 @@ class AlignmentTrainer(Trainer):
         return language_model, tokenizer
 
     def get_lvm(self, lvm_model_name: str):
+        if "/" in lvm_model_name or "dinov3" in lvm_model_name.lower():
+            image_processor = AutoImageProcessor.from_pretrained(lvm_model_name)
+            vision_model = AutoModel.from_pretrained(lvm_model_name)
+
+            size = image_processor.size
+            if isinstance(size, dict):
+                height = size.get("height") or size.get("shortest_edge") or size.get(
+                    "width"
+                )
+                width = size.get("width") or size.get("shortest_edge") or height
+            else:
+                height = width = size
+            crop_size = getattr(image_processor, "crop_size", None)
+            if isinstance(crop_size, dict):
+                crop_h = crop_size.get("height") or crop_size.get("shortest_edge")
+                crop_w = crop_size.get("width") or crop_h
+            else:
+                crop_h = crop_w = crop_size
+
+            transform_steps = [_ensure_rgb_image]
+            if getattr(image_processor, "do_resize", True):
+                transform_steps.append(transforms.Resize((height, width)))
+            if getattr(image_processor, "do_center_crop", True) and crop_h and crop_w:
+                transform_steps.append(transforms.CenterCrop((crop_h, crop_w)))
+            transform_steps.extend(
+                [
+                    transforms.ToTensor(),
+                    transforms.Normalize(
+                        mean=image_processor.image_mean,
+                        std=image_processor.image_std,
+                    ),
+                ]
+            )
+            transform = transforms.Compose(transform_steps)
+
+            class HFVisionWrapper(torch.nn.Module):
+                def __init__(self, model):
+                    super().__init__()
+                    self.model = model
+
+                def forward(self, x):
+                    outputs = self.model(
+                        pixel_values=x, output_hidden_states=True, return_dict=True
+                    )
+                    # drop the embedding output so indices match transformer blocks
+                    hidden_states = outputs.hidden_states[1:]
+                    return {
+                        f"blocks.{i}.out": h for i, h in enumerate(hidden_states)
+                    }
+
+            vision_model = HFVisionWrapper(vision_model)
+            vision_model = vision_model.to(self.device)
+            vision_model = vision_model.eval()
+            return vision_model, transform
+
         vision_model = timm.create_model(lvm_model_name, pretrained=True)
         transform = create_transform(
             **resolve_data_config(vision_model.pretrained_cfg, model=vision_model)
@@ -163,10 +256,17 @@ class AlignmentTrainer(Trainer):
         suffix: str = "",
         dataset_name: Optional[str] = None,
     ):
-        if hasattr(loader.dataset, "name"):
-            dataset_name = loader.dataset.name
+        if hasattr(loader.dataset, "precomputed_text_features"):
+            return loader.dataset.precomputed_text_features
+        dataset_ref = loader.dataset
+        base_dataset = dataset_ref.dataset if isinstance(dataset_ref, Subset) else dataset_ref
+        if hasattr(base_dataset, "name"):
+            dataset_name = base_dataset.name
         elif dataset_name is None:
-            dataset_name = type(loader.dataset).__name__
+            dataset_name = type(base_dataset).__name__
+        dataset_name = AlignmentTrainer.build_dataset_tag(
+            base_dataset, dataset_name, dataset_size=len(loader.dataset)
+        )
         save_path = AlignmentTrainer.get_feature_save_path(
             m_name=llm_model_name,
             d_name=dataset_name,
@@ -180,19 +280,32 @@ class AlignmentTrainer(Trainer):
             return llm_feats
 
         language_model, tokenizer = self.get_llm(llm_model_name=llm_model_name)
-        loader.dataset.tokenizer = tokenizer
-        if hasattr(loader.dataset, "loading_type"):
+        dataset_ref.tokenizer = tokenizer
+        if hasattr(dataset_ref, "loading_type"):
             # for optimizing the loading and looping
-            loader.dataset.loading_type = LoadingType.TXT_ONLY
-        _df = loader.dataset.df
-        loader.dataset.apply_tokenizer()
+            dataset_ref.loading_type = LoadingType.TXT_ONLY
+        _df = dataset_ref.df.copy() if hasattr(dataset_ref, "df") else None
+        if hasattr(dataset_ref, "apply_tokenizer"):
+            dataset_ref.apply_tokenizer()
         # ensure this is still the same ordering
-        assert loader.dataset.df.equals(_df)
+        if _df is not None and hasattr(dataset_ref, "df"):
+            if not dataset_ref.df.equals(_df):
+                logger.warning("Dataset dataframe changed during tokenization.")
         del _df
 
         llm_feats = []
         for batch in tqdm(loader, total=len(loader), file=sys.stdout):
-            _, token_inputs = batch
+            if len(batch) == 2:
+                _, token_inputs = batch
+            elif len(batch) == 3:
+                _, token_inputs, _ = batch
+            else:
+                raise ValueError(f"Unexpected batch item size: {len(batch)}")
+
+            if not isinstance(token_inputs, dict):
+                token_inputs = tokenizer(
+                    list(token_inputs), padding="longest", return_tensors="pt"
+                )
             token_inputs = {
                 k: v.to(self.device).long() for (k, v) in token_inputs.items()
             }
@@ -248,10 +361,17 @@ class AlignmentTrainer(Trainer):
         suffix: str = "",
         dataset_name: Optional[str] = None,
     ):
-        if hasattr(loader.dataset, "name"):
-            dataset_name = loader.dataset.name
+        if hasattr(loader.dataset, "precomputed_image_features"):
+            return loader.dataset.precomputed_image_features
+        dataset_ref = loader.dataset
+        base_dataset = dataset_ref.dataset if isinstance(dataset_ref, Subset) else dataset_ref
+        if hasattr(base_dataset, "name"):
+            dataset_name = base_dataset.name
         elif dataset_name is None:
-            dataset_name = type(loader.dataset).__name__
+            dataset_name = type(base_dataset).__name__
+        dataset_name = AlignmentTrainer.build_dataset_tag(
+            base_dataset, dataset_name, dataset_size=len(loader.dataset)
+        )
         save_path = AlignmentTrainer.get_feature_save_path(
             m_name=lvm_model_name,
             d_name=dataset_name,
@@ -447,6 +567,37 @@ class AlignmentTrainer(Trainer):
 
         return sampled_df_alignment
 
+    def _should_save_embeddings(
+        self,
+        alignment_layer_combination: Tuple[int, int],
+        dataset_name: str,
+    ) -> bool:
+        if not self.save_embeddings_enabled:
+            return False
+        if self.save_embeddings_datasets is not None:
+            if dataset_name not in self.save_embeddings_datasets:
+                return False
+        if self.save_embedding_layer_combinations is not None:
+            return alignment_layer_combination in self.save_embedding_layer_combinations
+        return True
+
+    def _save_embeddings(
+        self,
+        dataset_name: str,
+        alignment_layer_combination: Tuple[int, int],
+        suffix: str,
+        payload: dict,
+    ) -> None:
+        run_name = wandb.run.name if wandb.run is not None else "offline"
+        save_dir = self.save_path / run_name / "saved_embeddings"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        image_layer_idx, text_layer_idx = alignment_layer_combination
+        save_path = (
+            save_dir
+            / f"{dataset_name}_img{image_layer_idx}_txt{text_layer_idx}_{suffix}.pt"
+        )
+        torch.save(payload, save_path)
+
     def fit(
         self,
         n_random_subsample_train: Optional[int] = None,
@@ -454,6 +605,28 @@ class AlignmentTrainer(Trainer):
         additional_unimodal_data: Optional[Dict[str, list]] = None,
         n_random_additional_feats: Optional[int] = None,
     ):
+        def _subsample_loader(loader: DataLoader, n_samples: Optional[int]):
+            if n_samples is None:
+                return loader
+            dataset = loader.dataset
+            if n_samples >= len(dataset):
+                return loader
+            generator = torch.Generator().manual_seed(self.config["random_state"])
+            indices = torch.randperm(len(dataset), generator=generator)[:n_samples]
+            subset = Subset(dataset, indices.tolist())
+            return DataLoader(
+                subset,
+                batch_size=loader.batch_size,
+                drop_last=False,
+                shuffle=False,
+                pin_memory=loader.pin_memory,
+                num_workers=loader.num_workers,
+                collate_fn=loader.collate_fn,
+            )
+
+        train_loader = _subsample_loader(self.train_dataset, n_random_subsample_train)
+        val_loader = _subsample_loader(self.val_dataset, n_random_subsample_val)
+
         # pre-compute the embeddings from both modalities
         # first embed the validation set since we're returning
         # the models for the training set
@@ -462,7 +635,7 @@ class AlignmentTrainer(Trainer):
             if self.config["features"].get("layer_img") is not None:
                 image_val_suffix += f"_layer-{self.config['features']['layer_img']}"
             image_features_val = self.get_image_features(
-                loader=self.val_dataset,
+                loader=val_loader,
                 lvm_model_name=self.lvm_model_name,
                 suffix=image_val_suffix,
             )
@@ -474,7 +647,7 @@ class AlignmentTrainer(Trainer):
             if self.config["features"].get("layer_img") is not None:
                 text_val_suffix += f"_layer-{self.config['features']['layer_txt']}"
             text_features_val = self.get_text_features(
-                loader=self.val_dataset,
+                loader=val_loader,
                 llm_model_name=self.llm_model_name,
                 suffix=text_val_suffix,
             )
@@ -483,7 +656,7 @@ class AlignmentTrainer(Trainer):
 
         if self.image_features_train is None:
             image_features_train = self.get_image_features(
-                loader=self.train_dataset,
+                loader=train_loader,
                 lvm_model_name=self.lvm_model_name,
                 suffix=image_val_suffix.replace("val-", "train-"),
             )
@@ -492,7 +665,7 @@ class AlignmentTrainer(Trainer):
 
         if self.text_features_train is None:
             text_features_train = self.get_text_features(
-                loader=self.train_dataset,
+                loader=train_loader,
                 llm_model_name=self.llm_model_name,
                 suffix=text_val_suffix.replace("val-", "train-"),
             )
@@ -514,6 +687,7 @@ class AlignmentTrainer(Trainer):
         if (
             self.config["training"]["drop_duplicates"]
             and hasattr(self.train_dataset.dataset, "df")
+            and self.train_dataset.dataset.df is not None
             and "image_path" in self.train_dataset.dataset.df.columns
         ):
             sel_train_indices = (
@@ -623,6 +797,17 @@ class AlignmentTrainer(Trainer):
         # for each sampled combination
         # train the alignment between the representations
         print(sampled_df_alignment)
+        if self.save_embeddings_enabled and self.save_embeddings_top_k:
+            df_sorted = sampled_df_alignment.copy()
+            if "alignment_score" in df_sorted.columns and df_sorted[
+                "alignment_score"
+            ].notna().any():
+                df_sorted = df_sorted.sort_values(
+                    by="alignment_score", ascending=False
+                )
+            self.save_embedding_layer_combinations = [
+                tuple(x) for x in df_sorted["indices"].tolist()[: self.save_embeddings_top_k]
+            ]
         comb_iter = sampled_df_alignment.iterrows()
         for i_comb, (_, layer_series) in enumerate(comb_iter):
             layer_comb = layer_series["indices"]
@@ -804,9 +989,12 @@ class AlignmentTrainer(Trainer):
                 logger.debug(f"LR finder complete. Using learning rate: {optimal_lr}")
                 self.config["training"]["learning_rate"] = optimal_lr
 
-            params = list(alignment_image.parameters()) + list(
-                alignment_text.parameters()
-            )
+        params = list(alignment_image.parameters()) + list(
+            alignment_text.parameters()
+        )
+        loss_params = [p for p in self.loss.parameters() if p.requires_grad]
+        if loss_params:
+            params += loss_params
 
             optimizer = optimizer_cls(
                 params=params,
@@ -1391,7 +1579,15 @@ class AlignmentTrainer(Trainer):
                 suffix=f"eval-{self.config['features']['pool_txt']}",
             )
 
-            dataset_classes = DATASETS_TO_CLASSES[eval_dataset_name.lower()]
+            dataset_key = eval_dataset_name.lower()
+            dataset_classes = DATASETS_TO_CLASSES.get(dataset_key)
+            if dataset_classes is None:
+                if hasattr(e_dataset, "classes"):
+                    dataset_classes = list(e_dataset.classes)
+                else:
+                    raise KeyError(
+                        f"Missing class list for zero-shot dataset: {eval_dataset_name}"
+                    )
             zero_shot_classifier = build_zero_shot_classifier(
                 language_model=language_model,
                 alignment_layer=alignment_text,
@@ -1400,7 +1596,7 @@ class AlignmentTrainer(Trainer):
                 layer_index=text_layer_idx,
                 classnames=dataset_classes,
                 templates=(
-                    DATASETS_TO_TEMPLATES[eval_dataset_name.lower()]
+                    DATASETS_TO_TEMPLATES.get(dataset_key, SIMPLE_PROMPT_TEMPLATE)
                     if self.config["evaluation"]["use_extended_prompts"]
                     else SIMPLE_PROMPT_TEMPLATE
                 ),
@@ -1612,6 +1808,24 @@ class AlignmentTrainer(Trainer):
                     score = m.compute().item()
                     log_str += f" {m_name}: {score:.3f},"
                     result_dict[f"{eval_dataset_name}/{m_name}"] = score
+            if self._should_save_embeddings(
+                alignment_layer_combination, eval_dataset_name
+            ):
+                if type(l_aligned_image_feats) is not torch.Tensor:
+                    l_aligned_image_feats = torch.cat(l_aligned_image_feats).cpu()
+                payload = {
+                    "image_embeds": l_aligned_image_feats.cpu(),
+                    "text_embeds": zero_shot_classifier.cpu(),
+                    "targets": np.concatenate(all_targets),
+                    "classnames": dataset_classes,
+                    "layer_combination": alignment_layer_combination,
+                }
+                self._save_embeddings(
+                    dataset_name=eval_dataset_name,
+                    alignment_layer_combination=alignment_layer_combination,
+                    suffix="zero_shot",
+                    payload=payload,
+                )
             logger.info(log_str[:-1])
             log_dict = {
                 f"{alignment_layer_combination_str}/{k}": v
@@ -1645,8 +1859,9 @@ class AlignmentTrainer(Trainer):
         self.df_scores_zero_shot.loc[len(self.df_scores_zero_shot)] = pd.Series(
             result_dict
         )
+        run_name = wandb.run.name if wandb.run is not None else "offline"
         self.df_scores_zero_shot.to_csv(
-            f"{self.save_path / wandb.run.name / self.add_exp_suffix_to_name('zero_shot_results')}.csv",
+            f"{self.save_path / run_name / self.add_exp_suffix_to_name('zero_shot_results')}.csv",
             index=False,
         )
 
@@ -1691,8 +1906,6 @@ class AlignmentTrainer(Trainer):
                 llm_model_name=self.llm_model_name,
                 suffix=f"eval-{self.config['features']['pool_txt']}",
             )
-            num_samples = image_features_val.shape[0]
-
             # drop duplicates for fair comparison
             if (
                 self.config["evaluation"]["drop_duplicates"]
@@ -1704,6 +1917,26 @@ class AlignmentTrainer(Trainer):
                 ).index
                 image_features_val = image_features_val[unique_val_indices]
                 text_features_val = text_features_val[unique_val_indices]
+
+            df = e_dataset.df if hasattr(e_dataset, "df") else None
+            subset_cfg = self.config["evaluation"].get("retrieval_subset", {})
+            if subset_cfg:
+                subset_size = subset_cfg.get("size")
+                if subset_size and subset_size < len(image_features_val):
+                    seed = subset_cfg.get("seed", self.config["random_state"])
+                    rng = np.random.default_rng(seed)
+                    subset_indices = rng.choice(
+                        len(image_features_val), size=subset_size, replace=False
+                    )
+                    subset_indices = np.sort(subset_indices)
+                    image_features_val = image_features_val[subset_indices]
+                    text_features_val = text_features_val[subset_indices]
+                    if df is not None:
+                        df = df.iloc[subset_indices].reset_index(drop=True)
+                        logger.info(
+                            f"Using retrieval subset of {len(df)} samples for {eval_dataset_name}"
+                        )
+            num_samples = image_features_val.shape[0]
 
             aligned_image_feats = []
             aligned_text_feats = []
@@ -1730,8 +1963,23 @@ class AlignmentTrainer(Trainer):
 
             aligned_image_feats = torch.cat(aligned_image_feats).cpu()
             aligned_text_feats = torch.cat(aligned_text_feats).cpu()
+            if self._should_save_embeddings(
+                alignment_layer_combination, eval_dataset_name
+            ):
+                payload = {
+                    "image_embeds": aligned_image_feats,
+                    "text_embeds": aligned_text_feats,
+                    "layer_combination": alignment_layer_combination,
+                }
+                if df is not None:
+                    payload["dataframe"] = df
+                self._save_embeddings(
+                    dataset_name=eval_dataset_name,
+                    alignment_layer_combination=alignment_layer_combination,
+                    suffix="retrieval",
+                    payload=payload,
+                )
 
-            df = e_dataset.df if hasattr(e_dataset, "df") else None
             recalls_i2t = retrieval_metrics_df(
                 image_embeds=aligned_image_feats,
                 text_embeds=aligned_text_feats,
@@ -1751,6 +1999,63 @@ class AlignmentTrainer(Trainer):
             recalls_i2t = {f"I2T-{k}": v for k, v in recalls_i2t.items()}
             recalls_t2i = {f"T2I-{k}": v for k, v in recalls_t2i.items()}
             recalls = recalls_i2t | recalls_t2i
+            if "I2T-R@1" in recalls and "T2I-R@1" in recalls:
+                recalls["R@1-avg"] = (recalls["I2T-R@1"] + recalls["T2I-R@1"]) / 2
+
+            alignment_cfg = self.config["evaluation"].get("alignment_metrics", {})
+            alignment_enabled = (
+                alignment_cfg
+                if isinstance(alignment_cfg, bool)
+                else alignment_cfg.get("enabled", False)
+            )
+            if alignment_enabled:
+                if df is None:
+                    logger.warning(
+                        f"Skipping alignment metrics for {eval_dataset_name}: missing dataframe"
+                    )
+                else:
+                    label_column = (
+                        alignment_cfg.get("label_column")
+                        if isinstance(alignment_cfg, dict)
+                        else None
+                    )
+                    if label_column is None:
+                        if "image_id" in df.columns:
+                            label_column = "image_id"
+                        elif "image_path" in df.columns:
+                            label_column = "image_path"
+                        elif "image_name" in df.columns:
+                            label_column = "image_name"
+                    if label_column is None or label_column not in df.columns:
+                        logger.warning(
+                            f"Skipping alignment metrics for {eval_dataset_name}: "
+                            f"label column not found"
+                        )
+                    else:
+                        labels = df[label_column].astype(str).tolist()
+                        purity = compute_cross_modal_purity_score(
+                            aligned_image_feats,
+                            aligned_text_feats,
+                            labels,
+                            batch_size=alignment_cfg.get(
+                                "batch_size", self.eval_batch_size
+                            ),
+                        )
+                        pooled_embeds = torch.cat(
+                            [aligned_image_feats, aligned_text_feats], dim=0
+                        )
+                        pooled_labels = labels + labels
+                        silhouette = compute_silhouette_score(
+                            pooled_embeds,
+                            pooled_labels,
+                            metric=alignment_cfg.get("silhouette_metric", "cosine"),
+                            sample_size=alignment_cfg.get("silhouette_sample_size"),
+                            random_state=alignment_cfg.get(
+                                "seed", self.config["random_state"]
+                            ),
+                        )
+                        recalls["Purity"] = purity
+                        recalls["Silhouette"] = silhouette
 
             log_str = f"{eval_dataset_name.capitalize()} -"
             for m_name, score in recalls.items():
@@ -1801,7 +2106,8 @@ class AlignmentTrainer(Trainer):
         self.df_scores_retrieval.loc[len(self.df_scores_retrieval)] = pd.Series(
             result_dict
         )
+        run_name = wandb.run.name if wandb.run is not None else "offline"
         self.df_scores_retrieval.to_csv(
-            f"{self.save_path / wandb.run.name / self.add_exp_suffix_to_name('retrieval_results')}.csv",
+            f"{self.save_path / run_name / self.add_exp_suffix_to_name('retrieval_results')}.csv",
             index=False,
         )

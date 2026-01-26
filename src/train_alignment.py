@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 from typing import List
 
+import pandas as pd
 import torchvision.transforms as transforms
 import yaml
 from loguru import logger
@@ -9,7 +10,11 @@ from torch.utils.data import DataLoader
 
 from src.core.src.datasets.image_text_dataset import ImageTextDataset
 from src.core.src.utils.loader import Loader, merge_dicts
-from src.dataset_preparation.data_utils import get_datasets, get_default_transforms
+from src.dataset_preparation.data_utils import (
+    EmbeddingPairDataset,
+    get_datasets,
+    get_default_transforms,
+)
 from src.trainers.alignment_trainer import AlignmentTrainer
 from src.trainers.clip_eval_trainer import CLIPEvalTrainer
 from src.trainers.csa_trainer import CSATrainer
@@ -79,6 +84,47 @@ def load_dataset(
     return train_dataset, val_dataset
 
 
+def load_embedding_dataset(
+    config: dict,
+    batch_size: int = 16,
+    num_workers: int = 1,
+):
+    paths = config["features"]["embedding_paths"]
+    train_df = None
+    val_df = None
+    if paths.get("train_meta_csv"):
+        train_df = pd.read_csv(paths["train_meta_csv"])
+    if paths.get("val_meta_csv"):
+        val_df = pd.read_csv(paths["val_meta_csv"])
+    train_dataset = EmbeddingPairDataset(
+        image_embeddings=paths["train_image"],
+        text_embeddings=paths["train_text"],
+        df=train_df,
+    )
+    val_dataset = EmbeddingPairDataset(
+        image_embeddings=paths.get("val_image", paths["train_image"]),
+        text_embeddings=paths.get("val_text", paths["train_text"]),
+        df=val_df,
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        drop_last=False,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=num_workers,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        drop_last=False,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=num_workers,
+    )
+    return train_loader, val_loader
+
+
 parser = argparse.ArgumentParser(
     description="Experiments for the Representation Alignment.",
 )
@@ -105,15 +151,22 @@ if __name__ == "__main__":
     config = merge_dicts(config.get("defaults", {}), config.get("overrides", {}))
 
     data_path = Path(config["paths"]["data_path"])
-    train_dataset, val_dataset = load_dataset(
-        dataset_name=config["features"]["dataset"],
-        data_path=data_path,
-        batch_size=config["features"]["batch_size"],
-        num_workers=config["features"]["num_workers"],
-        label_templates=config["features"]["label_templates"],
-        template_key=config["features"]["template_key"],
-        precompute_captions=config["features"]["precompute_captions"],
-    )
+    if config["features"].get("input_type") == "embedding":
+        train_dataset, val_dataset = load_embedding_dataset(
+            config=config,
+            batch_size=config["features"]["batch_size"],
+            num_workers=config["features"]["num_workers"],
+        )
+    else:
+        train_dataset, val_dataset = load_dataset(
+            dataset_name=config["features"]["dataset"],
+            data_path=data_path,
+            batch_size=config["features"]["batch_size"],
+            num_workers=config["features"]["num_workers"],
+            label_templates=config["features"]["label_templates"],
+            template_key=config["features"]["template_key"],
+            precompute_captions=config["features"]["precompute_captions"],
+        )
 
     # additional unimodal data
     additional_unimodal_data = None
@@ -208,5 +261,9 @@ if __name__ == "__main__":
         trainer = CLIPEvalTrainer(**trainer_kwargs)
     else:
         trainer = AlignmentTrainer(**trainer_kwargs)
-    trainer.fit(additional_unimodal_data=additional_unimodal_data)
+    trainer.fit(
+        n_random_subsample_train=config["training"].get("n_samples_train"),
+        n_random_subsample_val=config["training"].get("n_samples_val"),
+        additional_unimodal_data=additional_unimodal_data,
+    )
     del trainer

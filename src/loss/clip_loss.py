@@ -1,3 +1,4 @@
+import math
 from enum import Enum
 from typing import Optional, Tuple
 
@@ -146,6 +147,7 @@ class CLIPLoss(nn.Module):
         self,
         temperature: float = 0.07,
         normalize_latents: bool = False,
+        learnable_temperature: bool = False,
         warmup_steps: int = 500,
         structure_lambda: float = 10,
         structure_levels: int = 1,
@@ -162,6 +164,12 @@ class CLIPLoss(nn.Module):
 
         self.temperature = temperature
         self.normalize_latents = normalize_latents
+        self.learnable_temperature = learnable_temperature
+        if self.learnable_temperature:
+            init_logit = math.log(1.0 / temperature)
+            self.logit_scale = nn.Parameter(torch.tensor(init_logit))
+        else:
+            self.register_buffer("logit_scale", torch.tensor(math.log(1.0 / temperature)))
 
         self.structure_lambda_base = structure_lambda
         self.structure_levels = structure_levels
@@ -179,6 +187,7 @@ class CLIPLoss(nn.Module):
         name = "CLIPLoss"
         name += f"(temp={self.temperature}"
         name += f", norm={self.normalize_latents}"
+        name += f", learnable_temp={self.learnable_temperature}"
         if self.structure_lambda > 0:
             name += f", structure_distance={self.structure_distance.name}"
             name += f", structure_centering={self.structure_centering.name}"
@@ -212,14 +221,15 @@ class CLIPLoss(nn.Module):
                 text_embeddings_aligned, p=2, dim=1
             )
 
-        # Standard CLIP contrastive loss
-        logits = image_embeddings_aligned @ text_embeddings_aligned.T / self.temperature
+        # Standard CLIP contrastive loss with a (potentially) learnable scale
+        scale = self.logit_scale.exp()
+        logits = image_embeddings_aligned @ text_embeddings_aligned.T * scale
         labels = torch.arange(logits.size(0), device=logits.device)
         clip_loss = (
             F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)
         ) / 2
 
-        loss_dict = {"clip_loss": clip_loss.item()}
+        loss_dict = {"clip_loss": clip_loss.item(), "logit_scale": scale.item()}
         total_loss = clip_loss
         if self.structure_lambda > 0:
             if add_image_features is not None:

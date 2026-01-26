@@ -10,6 +10,7 @@ import torchmetrics
 import torchvision.transforms as transforms
 import wandb
 from loguru import logger
+from sklearn.decomposition import PCA
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import CLIPModel, CLIPProcessor
@@ -21,6 +22,11 @@ from src.evaluation.consts import (
     DATASETS_TO_CLASSES,
     DATASETS_TO_TEMPLATES,
     SIMPLE_PROMPT_TEMPLATE,
+)
+from src.evaluation.alignment_metrics import (
+    compute_cross_modal_purity_score,
+    compute_purity_score,
+    compute_silhouette_score,
 )
 from src.evaluation.retrieval import retrieval_metrics_df
 from src.evaluation.zero_shot_classifier import (
@@ -59,6 +65,26 @@ class CLIPEvalTrainer(AlignmentTrainer):
             wandb_project_name=wandb_project_name,
             wandb_notes=wandb_notes,
         )
+        self._pca_model: Optional[PCA] = None
+
+    def _maybe_fit_pca(self, image_features: torch.Tensor, text_features: torch.Tensor):
+        pca_dim = self.config["evaluation"].get("pca_dim")
+        if not pca_dim:
+            return None
+        if self._pca_model is not None:
+            return self._pca_model
+        features = torch.cat([image_features, text_features], dim=0).cpu().numpy()
+        pca = PCA(n_components=pca_dim, random_state=self.config["random_state"])
+        pca.fit(features)
+        self._pca_model = pca
+        logger.info(f"Fitted PCA with dim={pca_dim}")
+        return self._pca_model
+
+    def _apply_pca(self, features: torch.Tensor):
+        if self._pca_model is None:
+            return features
+        transformed = self._pca_model.transform(features.cpu().numpy())
+        return torch.tensor(transformed)
 
     def fit(
         self,
@@ -96,8 +122,8 @@ class CLIPEvalTrainer(AlignmentTrainer):
         model = CLIPModel.from_pretrained(self.lvm_model_name).to(self.device)
         processor = CLIPProcessor.from_pretrained(self.lvm_model_name)
         feat_processor = processor.image_processor  # holds mean/std
-
-        language_model, tokenizer = self.get_llm(llm_model_name=self.llm_model_name)
+        language_model = model
+        tokenizer = processor.tokenizer
         for eval_dataset_name, e_dataset in self.eval_zero_shot_datasets:
             image_transform = transforms.Compose(
                 [
@@ -123,7 +149,15 @@ class CLIPEvalTrainer(AlignmentTrainer):
                 suffix=f"eval-{self.config['features']['pool_txt']}",
             )
 
-            dataset_classes = DATASETS_TO_CLASSES[eval_dataset_name.lower()]
+            dataset_key = eval_dataset_name.lower()
+            dataset_classes = DATASETS_TO_CLASSES.get(dataset_key)
+            if dataset_classes is None:
+                if hasattr(e_dataset, "classes"):
+                    dataset_classes = list(e_dataset.classes)
+                else:
+                    raise KeyError(
+                        f"Missing class list for zero-shot dataset: {eval_dataset_name}"
+                    )
             zero_shot_classifier = build_zero_shot_classifier(
                 language_model=language_model,
                 tokenizer=tokenizer,
@@ -131,7 +165,7 @@ class CLIPEvalTrainer(AlignmentTrainer):
                 layer_index=None,
                 classnames=dataset_classes,
                 templates=(
-                    DATASETS_TO_TEMPLATES[eval_dataset_name.lower()]
+                    DATASETS_TO_TEMPLATES.get(dataset_key, SIMPLE_PROMPT_TEMPLATE)
                     if self.config["evaluation"]["use_extended_prompts"]
                     else SIMPLE_PROMPT_TEMPLATE
                 ),
@@ -148,6 +182,7 @@ class CLIPEvalTrainer(AlignmentTrainer):
             # we move it to the cpu since in the loop we move chunks back
             # (used to optimize memory for big models)
             zero_shot_classifier = zero_shot_classifier.cpu()
+            zero_shot_classifier = self._apply_pca(zero_shot_classifier)
 
             eval_loader = DataLoader(
                 e_dataset,
@@ -244,6 +279,7 @@ class CLIPEvalTrainer(AlignmentTrainer):
 
                 # lvm_output = (batch_size, dim)
                 lvm_output = lvm_output.float().cpu()
+                lvm_output = self._apply_pca(lvm_output)
                 l_aligned_image_feats.append(lvm_output.cpu())
 
                 # compute the logits by measuring the similarity
@@ -342,11 +378,20 @@ class CLIPEvalTrainer(AlignmentTrainer):
 
         llm_feats = []
         for batch in tqdm(loader, total=len(loader), file=sys.stdout):
-            _, texts = batch
+            if len(batch) == 2:
+                _, texts = batch
+            elif len(batch) == 3:
+                _, texts, _ = batch
+            else:
+                raise ValueError(f"Unexpected batch item size: {len(batch)}")
             with torch.no_grad():
-                inputs = processor(text=texts, return_tensors="pt", padding=True).to(
-                    self.device
-                )
+                inputs = processor(
+                    text=texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=77,
+                ).to(self.device)
                 feats = model.get_text_features(**inputs)
                 llm_feats.append(feats.cpu())
         llm_feats = torch.cat(llm_feats).cpu()
@@ -386,7 +431,12 @@ class CLIPEvalTrainer(AlignmentTrainer):
         processor = CLIPProcessor.from_pretrained(lvm_model_name)
         feat_processor = processor.image_processor  # holds mean/std
 
-        image_transform = transforms.Resize((336, 336))
+        image_transform = transforms.Compose(
+            [
+                transforms.Resize((336, 336)),
+                transforms.ToTensor(),
+            ]
+        )
         set_transform_dataset(
             dataset=loader.dataset,
             image_transform=image_transform,
@@ -395,6 +445,13 @@ class CLIPEvalTrainer(AlignmentTrainer):
         lvm_feats = []
         for batch in tqdm(loader, total=len(loader), file=sys.stdout):
             images, _ = batch
+            if isinstance(images, list):
+                if torch.is_tensor(images[0]):
+                    images = torch.stack(images, dim=0)
+                else:
+                    images = torch.stack(
+                        [transforms.ToTensor()(img) for img in images], dim=0
+                    )
             with torch.no_grad():
                 # normalize per CLIP spec
                 mean = torch.tensor(feat_processor.image_mean, device=self.device).view(
@@ -464,6 +521,26 @@ class CLIPEvalTrainer(AlignmentTrainer):
                 text_features_val = text_features_val[unique_val_indices]
 
             df = e_dataset.df if hasattr(e_dataset, "df") else None
+            subset_cfg = self.config["evaluation"].get("retrieval_subset", {})
+            if subset_cfg:
+                subset_size = subset_cfg.get("size")
+                if subset_size and subset_size < len(image_features_val):
+                    seed = subset_cfg.get("seed", self.config["random_state"])
+                    rng = np.random.default_rng(seed)
+                    subset_indices = rng.choice(
+                        len(image_features_val), size=subset_size, replace=False
+                    )
+                    subset_indices = np.sort(subset_indices)
+                    image_features_val = image_features_val[subset_indices]
+                    text_features_val = text_features_val[subset_indices]
+                    if df is not None:
+                        df = df.iloc[subset_indices].reset_index(drop=True)
+                        logger.info(
+                            f"Using retrieval subset of {len(df)} samples for {eval_dataset_name}"
+                        )
+            self._maybe_fit_pca(image_features_val, text_features_val)
+            image_features_val = self._apply_pca(image_features_val)
+            text_features_val = self._apply_pca(text_features_val)
             recalls_i2t = retrieval_metrics_df(
                 image_embeds=image_features_val,
                 text_embeds=text_features_val,
@@ -483,6 +560,63 @@ class CLIPEvalTrainer(AlignmentTrainer):
             recalls_i2t = {f"I2T-{k}": v for k, v in recalls_i2t.items()}
             recalls_t2i = {f"T2I-{k}": v for k, v in recalls_t2i.items()}
             recalls = recalls_i2t | recalls_t2i
+            if "I2T-R@1" in recalls and "T2I-R@1" in recalls:
+                recalls["R@1-avg"] = (recalls["I2T-R@1"] + recalls["T2I-R@1"]) / 2
+
+            alignment_cfg = self.config["evaluation"].get("alignment_metrics", {})
+            alignment_enabled = (
+                alignment_cfg
+                if isinstance(alignment_cfg, bool)
+                else alignment_cfg.get("enabled", False)
+            )
+            if alignment_enabled:
+                if df is None:
+                    logger.warning(
+                        f"Skipping alignment metrics for {eval_dataset_name}: missing dataframe"
+                    )
+                else:
+                    label_column = (
+                        alignment_cfg.get("label_column")
+                        if isinstance(alignment_cfg, dict)
+                        else None
+                    )
+                    if label_column is None:
+                        if "image_id" in df.columns:
+                            label_column = "image_id"
+                        elif "image_path" in df.columns:
+                            label_column = "image_path"
+                        elif "image_name" in df.columns:
+                            label_column = "image_name"
+                    if label_column is None or label_column not in df.columns:
+                        logger.warning(
+                            f"Skipping alignment metrics for {eval_dataset_name}: "
+                            f"label column not found"
+                        )
+                    else:
+                        labels = df[label_column].astype(str).tolist()
+                        purity = compute_cross_modal_purity_score(
+                            image_features_val,
+                            text_features_val,
+                            labels,
+                            batch_size=alignment_cfg.get(
+                                "batch_size", self.eval_batch_size
+                            ),
+                        )
+                        pooled_embeds = torch.cat(
+                            [image_features_val, text_features_val], dim=0
+                        )
+                        pooled_labels = labels + labels
+                        silhouette = compute_silhouette_score(
+                            pooled_embeds,
+                            pooled_labels,
+                            metric=alignment_cfg.get("silhouette_metric", "cosine"),
+                            sample_size=alignment_cfg.get("silhouette_sample_size"),
+                            random_state=alignment_cfg.get(
+                                "seed", self.config["random_state"]
+                            ),
+                        )
+                        recalls["Purity"] = purity
+                        recalls["Silhouette"] = silhouette
 
             log_str = f"{eval_dataset_name.capitalize()} -"
             for m_name, score in recalls.items():

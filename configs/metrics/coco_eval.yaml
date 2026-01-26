@@ -1,0 +1,37 @@
+defaults: !include ../default.yaml
+
+overrides:
+    features:
+        batch_size: 32
+        num_workers: 8
+    training:
+        alignment_layer_name: "LinearAlignmentLayer"
+        alignment_layer_kwargs:
+            dim_alignment: 512
+        clip_loss_name: "CLIPLoss"
+        clip_loss:
+            temperature: 0.05
+            structure_lambda: 0
+        batch_size: 8
+        n_samples_train: 5000
+        n_samples_val: 2000
+        drop_duplicates: false
+    layer_selection:
+        best_only: true
+        last_only: false
+    evaluation:
+        batch_size: 4
+        zero_shot_datasets:
+            - "cifar10"
+            - "tiny_imagenet"
+        retrieval_datasets:
+            - "coco"
+        retrieval_subset:
+            size: 5000
+            seed: 42
+        alignment_metrics:
+            enabled: true
+            label_column: "image_path"
+            silhouette_metric: "cosine"
+            silhouette_sample_size: 10000
+            batch_size: 256

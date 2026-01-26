@@ -55,7 +55,11 @@ class Trainer(ABC, object):
                 )
                 run_name = f"{experiment_name}-{wandb.run.name}"
                 wandb.run.name = run_name
-                wandb.run.save()
+                try:
+                    wandb.run.save()
+                except TypeError:
+                    # wandb>=0.24 expects a glob string; skip to avoid crash
+                    logger.debug("wandb.run.save() requires glob_str; skipping.")
             self.run_dir = Path(wandb.run.dir)
         else:
             current_directory = self.config.get("work_dir", os.getcwd())

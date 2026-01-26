@@ -5,6 +5,7 @@ from typing import List, Optional, Union
 import numpy as np
 import torch
 import torchvision.datasets as dsets
+from PIL import Image
 import torchvision.transforms as transforms
 from loguru import logger
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
@@ -72,6 +73,39 @@ class FeatureDataset(Dataset):
         if self.targets is not None:
             return self.features[idx], int(self.targets[idx])
         return self.features[idx]
+
+
+class EmbeddingPairDataset(Dataset):
+    def __init__(
+        self,
+        image_embeddings: Union[str, Path, np.ndarray],
+        text_embeddings: Union[str, Path, np.ndarray],
+        df: Optional["pd.DataFrame"] = None,
+    ):
+        if isinstance(image_embeddings, (str, Path)):
+            image_embeddings = np.load(image_embeddings)
+        if isinstance(text_embeddings, (str, Path)):
+            text_embeddings = np.load(text_embeddings)
+        if image_embeddings.shape[0] != text_embeddings.shape[0]:
+            raise ValueError(
+                "Image/text embeddings must have same number of samples."
+            )
+        if image_embeddings.ndim == 2:
+            image_embeddings = image_embeddings[:, None, :]
+        if text_embeddings.ndim == 2:
+            text_embeddings = text_embeddings[:, None, :]
+        self.precomputed_image_features = torch.from_numpy(image_embeddings)
+        self.precomputed_text_features = torch.from_numpy(text_embeddings)
+        self.df = df
+
+    def __len__(self):
+        return self.precomputed_image_features.shape[0]
+
+    def __getitem__(self, idx):
+        return (
+            self.precomputed_image_features[idx],
+            self.precomputed_text_features[idx],
+        )
 
 
 def get_meta_dict(dataset):
@@ -162,8 +196,9 @@ def _ensure_rgb_image(image: torch.Tensor):
         if image.shape[0] != 3:
             image = image.expand(3, -1)
         return image
-    else:
-        return image.convert("RGB")
+    if isinstance(image, (str, Path)):
+        image = Image.open(image)
+    return image.convert("RGB")
 
 
 def _convert_image_to_rgb(image):
@@ -579,8 +614,87 @@ def get_datasets(dataset, transform, root_dir: Union[str, Path] = "./data", **kw
             d.mapping_number_to_class = mapping_number_to_class
             d.classes = [d.class_mapping_dict.get(x) for x in d.classes]
 
+    elif dataset in {
+        "tiny_imagenet",
+        "tiny-imagenet",
+        "tiny_imagenet_200",
+        "tiny-imagenet-200",
+        "tiny_imagenet_20",
+        "tiny-imagenet-20",
+    }:
+        root_candidates = [
+            Path(data_path) / "tiny-imagenet-200",
+            Path(data_path) / "tiny-imagenet-20",
+        ]
+        root_dir = next((p for p in root_candidates if p.exists()), None)
+        if root_dir is None:
+            raise FileNotFoundError(
+                f"Unable to find Tiny-ImageNet in {root_candidates}"
+            )
+        train_dataset = dsets.ImageFolder(
+            root=os.path.join(root_dir, "train"), transform=transform
+        )
+        wnids = list(train_dataset.classes)
+        wnid_to_idx = {wnid: i for i, wnid in enumerate(wnids)}
+        val_images = root_dir / "val" / "images"
+        val_ann = root_dir / "val" / "val_annotations.txt"
+
+        class TinyImageNetValDataset(Dataset):
+            def __init__(self, images_dir, ann_path, transform, wnid_to_idx):
+                self.images_dir = images_dir
+                self.transform = transform
+                self.samples = []
+                with open(ann_path, "r") as f:
+                    for line in f:
+                        parts = line.strip().split("\t")
+                        if len(parts) < 2:
+                            continue
+                        img_name, wnid = parts[0], parts[1]
+                        if wnid not in wnid_to_idx:
+                            continue
+                        self.samples.append(
+                            (os.path.join(images_dir, img_name), wnid_to_idx[wnid])
+                        )
+
+            def __len__(self):
+                return len(self.samples)
+
+            def __getitem__(self, idx):
+                img_path, target = self.samples[idx]
+                img = _ensure_rgb_image(img_path)
+                if self.transform is not None:
+                    img = self.transform(img)
+                return img, target
+
+        if not val_ann.exists():
+            val_dataset = dsets.ImageFolder(
+                root=os.path.join(root_dir, "val"), transform=transform
+            )
+        else:
+            val_dataset = TinyImageNetValDataset(
+                images_dir=str(val_images),
+                ann_path=str(val_ann),
+                transform=transform,
+                wnid_to_idx=wnid_to_idx,
+            )
+            val_dataset.classes = wnids
+
+        words_path = root_dir / "words.txt"
+        if words_path.exists():
+            wnid_to_name = {}
+            with open(words_path, "r") as words_file:
+                for line in words_file:
+                    wnid, names = line.strip().split("\t")
+                    wnid_to_name[wnid] = names.split(",")[0]
+            train_dataset.classes = [wnid_to_name.get(x, x) for x in wnids]
+            train_dataset.class_mapping_dict = wnid_to_name
+            val_dataset.classes = [wnid_to_name.get(x, x) for x in wnids]
+            val_dataset.class_mapping_dict = wnid_to_name
+
     elif dataset == "coco":
         coco_path = Path(data_path) / "COCO"
+        if not coco_path.exists():
+            coco_path = Path(data_path) / "coco"
         anno_path = coco_path / "annotations"
 
         train_path = coco_path / "train2014"

@@ -15,6 +15,11 @@ from tqdm import tqdm
 from src.alignment.cca_class import NormalizedCCA
 from src.core.src.utils.plotting import embedding_plot, embedding_plot_w_markers
 from src.dataset_preparation.data_utils import FeatureDataset, get_meta_dict
+from src.evaluation.alignment_metrics import (
+    compute_cross_modal_purity_score,
+    compute_purity_score,
+    compute_silhouette_score,
+)
 from src.evaluation.consts import (
     DATASETS_TO_CLASSES,
     DATASETS_TO_TEMPLATES,
@@ -241,7 +246,15 @@ class CSATrainer(AlignmentTrainer):
                 suffix=f"eval-{self.config['features']['pool_txt']}",
             )
 
-            dataset_classes = DATASETS_TO_CLASSES[eval_dataset_name.lower()]
+            dataset_key = eval_dataset_name.lower()
+            dataset_classes = DATASETS_TO_CLASSES.get(dataset_key)
+            if dataset_classes is None:
+                if hasattr(e_dataset, "classes"):
+                    dataset_classes = list(e_dataset.classes)
+                else:
+                    raise KeyError(
+                        f"Missing class list for zero-shot dataset: {eval_dataset_name}"
+                    )
             zero_shot_classifier = build_zero_shot_classifier(
                 language_model=language_model,
                 tokenizer=tokenizer,
@@ -249,7 +262,7 @@ class CSATrainer(AlignmentTrainer):
                 layer_index=text_layer_idx,
                 classnames=dataset_classes,
                 templates=(
-                    DATASETS_TO_TEMPLATES[eval_dataset_name.lower()]
+                    DATASETS_TO_TEMPLATES.get(dataset_key, SIMPLE_PROMPT_TEMPLATE)
                     if self.config["evaluation"]["use_extended_prompts"]
                     else SIMPLE_PROMPT_TEMPLATE
                 ),
@@ -509,6 +522,63 @@ class CSATrainer(AlignmentTrainer):
             recalls_i2t = {f"I2T-{k}": v for k, v in recalls_i2t.items()}
             recalls_t2i = {f"T2I-{k}": v for k, v in recalls_t2i.items()}
             recalls = recalls_i2t | recalls_t2i
+            if "I2T-R@1" in recalls and "T2I-R@1" in recalls:
+                recalls["R@1-avg"] = (recalls["I2T-R@1"] + recalls["T2I-R@1"]) / 2
+
+            alignment_cfg = self.config["evaluation"].get("alignment_metrics", {})
+            alignment_enabled = (
+                alignment_cfg
+                if isinstance(alignment_cfg, bool)
+                else alignment_cfg.get("enabled", False)
+            )
+            if alignment_enabled:
+                if df is None:
+                    logger.warning(
+                        f"Skipping alignment metrics for {eval_dataset_name}: missing dataframe"
+                    )
+                else:
+                    label_column = (
+                        alignment_cfg.get("label_column")
+                        if isinstance(alignment_cfg, dict)
+                        else None
+                    )
+                    if label_column is None:
+                        if "image_id" in df.columns:
+                            label_column = "image_id"
+                        elif "image_path" in df.columns:
+                            label_column = "image_path"
+                        elif "image_name" in df.columns:
+                            label_column = "image_name"
+                    if label_column is None or label_column not in df.columns:
+                        logger.warning(
+                            f"Skipping alignment metrics for {eval_dataset_name}: "
+                            f"label column not found"
+                        )
+                    else:
+                        labels = df[label_column].astype(str).tolist()
+                        purity = compute_cross_modal_purity_score(
+                            aligned_image_feats,
+                            aligned_text_feats,
+                            labels,
+                            batch_size=alignment_cfg.get(
+                                "batch_size", self.eval_batch_size
+                            ),
+                        )
+                        pooled_embeds = torch.cat(
+                            [aligned_image_feats, aligned_text_feats], dim=0
+                        )
+                        pooled_labels = labels + labels
+                        silhouette = compute_silhouette_score(
+                            pooled_embeds,
+                            pooled_labels,
+                            metric=alignment_cfg.get("silhouette_metric", "cosine"),
+                            sample_size=alignment_cfg.get("silhouette_sample_size"),
+                            random_state=alignment_cfg.get(
+                                "seed", self.config["random_state"]
+                            ),
+                        )
+                        recalls["Purity"] = purity
+                        recalls["Silhouette"] = silhouette
 
             log_str = f"{eval_dataset_name.capitalize()} -"
             for m_name, score in recalls.items():
