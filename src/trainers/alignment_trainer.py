@@ -626,6 +626,10 @@ class AlignmentTrainer(Trainer):
 
         train_loader = _subsample_loader(self.train_dataset, n_random_subsample_train)
         val_loader = _subsample_loader(self.val_dataset, n_random_subsample_val)
+        if n_random_subsample_train is not None:
+            self.n_random_subsample_train = n_random_subsample_train
+        if n_random_subsample_val is not None:
+            self.n_random_subsample_val = n_random_subsample_val
 
         # pre-compute the embeddings from both modalities
         # first embed the validation set since we're returning
