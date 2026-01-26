@@ -19,11 +19,11 @@ Outputs (in the subset directory):
 
 The `jointgwot/scripts/run_ours.sh` pipeline shows the typical parameters used (e.g., `num_classes=50`, `n_train=2000/5000/10000`).
 
-We keep the pre-built subsets here:
+We keep the pre-built subsets under the COCO subset directory, e.g.:
 ```
-/home/yuheng/jointgwot/dataset/coco/subsets/coco_pairs50_2k/coco_2k
-/home/yuheng/jointgwot/dataset/coco/subsets/coco_pairs50_5k/coco_5k
-/home/yuheng/jointgwot/dataset/coco/subsets/coco_pairs50_10k/coco_10k
+.../dataset/coco/subsets/coco_pairs50_2k/coco_2k
+.../dataset/coco/subsets/coco_pairs50_5k/coco_5k
+.../dataset/coco/subsets/coco_pairs50_10k/coco_10k
 ```
 
 ## 2) Encoders and feature extraction
@@ -36,7 +36,7 @@ Feature caching is enabled and keyed by dataset tag (annotation file, image dir,
 ## 3) Benchmarks and scripts
 We run **four benchmarks**: `csa_only`, `structure+csa`, `structure+mlp`, and `clip`.
 
-### (A) CSA-only (ours)
+### (A) CSA-only
 Script: `scripts/run_coco_csa_only.sh`
 - Runs CSA (no STRUCTURE training loop) on each subset and latent dim.
 
@@ -76,11 +76,11 @@ Zero-shot and retrieval are evaluated in `src/trainers/alignment_trainer.py` and
 ## 5) Collect results into a single CSV
 Use:
 ```
-python /home/yuheng/task/STRUCTURE/scripts/collect_benchmark_results.py
+python scripts/collect_benchmark_results.py
 ```
 This writes:
 ```
-/home/yuheng/task/STRUCTURE/results/benchmark_summary.csv
+results/benchmark_summary.csv
 ```
 The table includes:
 - `Purity`, `Silhouette`
@@ -121,9 +121,9 @@ Script: `scripts/plot_structure_mlp_embeddings.py`
 
 Example:
 ```
-python /home/yuheng/task/STRUCTURE/scripts/plot_structure_mlp_embeddings.py \
-  --subset_dir /home/yuheng/jointgwot/dataset/coco/subsets/coco_pairs50_2k \
-  --out_dir /home/yuheng/task/STRUCTURE/results/plots_mlp \
+python scripts/plot_structure_mlp_embeddings.py \
+  --subset_dir /path/to/coco/subsets/coco_pairs50_2k \
+  --out_dir results/plots_mlp \
   --num_labels 4 --max_samples 10 --dim_alignment 128 --epochs 50 --device cuda
 ```
 
