@@ -36,7 +36,16 @@ def main() -> None:
     p.add_argument(
         "--methods",
         nargs="+",
-        default=["csa", "mlp", "clip", "clip_raw", "clip_structure"],
+        default=[
+            "csa",
+            "mlp",
+            "clip",
+            "clip_raw",
+            "clip_structure",
+            "csa_only",
+            "csa_rs",
+            "mlp_rs",
+        ],
     )
     p.add_argument("--dims", nargs="+", type=int, default=[128, 256])
     args = p.parse_args()
@@ -98,6 +107,8 @@ def main() -> None:
                     run_tag = f"clip_coco_{subset}_pca{dim}"
                 elif method == "clip_structure":
                     run_tag = f"clip_structure_coco_{subset}_d{dim}"
+                elif method in {"csa_only", "csa_rs", "mlp_rs"}:
+                    run_tag = f"coco_{subset}_{method}_d{dim}"
                 else:
                     run_tag = f"coco_{subset}_{method}_d{dim}"
                 run_dir = _find_run_dir(results_dir, run_tag)
