@@ -426,14 +426,14 @@ class AlignmentTrainer(Trainer):
         self,
         image_features: torch.Tensor,
         text_features: torch.Tensor,
+        dataset_tag: Optional[str] = None,
     ):
         # compute similarity between the models on training set
         logger.debug("Computing alignment between modalities")
-        alignment_csv = (
-            self.save_path
-            / self.exp_name
-            / (self.add_exp_suffix_to_name("df_alignment") + ".csv")
-        )
+        suffix = self.add_exp_suffix_to_name("df_alignment")
+        if dataset_tag:
+            suffix = f"{suffix}_{dataset_tag}"
+        alignment_csv = self.save_path / self.exp_name / f"{suffix}.csv"
         # only read from memory when we're not subsampling!
         if (
             alignment_csv.exists()
@@ -473,14 +473,13 @@ class AlignmentTrainer(Trainer):
             df_alignment.to_csv(alignment_csv, index=False)
 
         n_score_bins = self.config["layer_selection"]["n_score_bins"]
+        sampled_suffix = self.add_exp_suffix_to_name("sampled_df_alignment")
+        if dataset_tag:
+            sampled_suffix = f"{sampled_suffix}_{dataset_tag}"
         sampled_csv = (
             self.save_path
             / self.exp_name
-            / (
-                self.add_exp_suffix_to_name("sampled_df_alignment")
-                + f"_bins{n_score_bins}"
-                + ".csv"
-            )
+            / (f"{sampled_suffix}_bins{n_score_bins}.csv")
         )
         if (
             sampled_csv.exists()
@@ -784,9 +783,21 @@ class AlignmentTrainer(Trainer):
             self.config["features"].get("layer_img") is None
             and self.config["features"].get("layer_txt") is None
         ):
+            dataset_ref = train_loader.dataset
+            base_dataset = (
+                dataset_ref.dataset if isinstance(dataset_ref, Subset) else dataset_ref
+            )
+            if hasattr(base_dataset, "name"):
+                dataset_name = base_dataset.name
+            else:
+                dataset_name = type(base_dataset).__name__
+            dataset_tag = AlignmentTrainer.build_dataset_tag(
+                base_dataset, dataset_name, dataset_size=len(dataset_ref)
+            )
             sampled_df_alignment = self.compute_layer_alignment(
                 image_features=image_features_train,
                 text_features=text_features_train,
+                dataset_tag=dataset_tag,
             )
         else:
             sampled_df_alignment = pd.DataFrame(columns=["indices", "alignment_score"])

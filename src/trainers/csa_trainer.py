@@ -9,7 +9,7 @@ import torch
 import torchmetrics
 import wandb
 from loguru import logger
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from src.alignment.cca_class import NormalizedCCA
@@ -132,9 +132,21 @@ class CSATrainer(AlignmentTrainer):
             self.config["features"].get("layer_img") is None
             and self.config["features"].get("layer_txt") is None
         ):
+            dataset_ref = self.train_dataset.dataset
+            base_dataset = (
+                dataset_ref.dataset if isinstance(dataset_ref, Subset) else dataset_ref
+            )
+            if hasattr(base_dataset, "name"):
+                dataset_name = base_dataset.name
+            else:
+                dataset_name = type(base_dataset).__name__
+            dataset_tag = AlignmentTrainer.build_dataset_tag(
+                base_dataset, dataset_name, dataset_size=len(dataset_ref)
+            )
             sampled_df_alignment = self.compute_layer_alignment(
                 image_features=image_features_train,
                 text_features=text_features_train,
+                dataset_tag=dataset_tag,
             )
         else:
             sampled_df_alignment = pd.DataFrame(columns=["indices", "alignment_score"])
