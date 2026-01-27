@@ -69,6 +69,10 @@ class CSATrainer(AlignmentTrainer):
         n_random_subsample_val: Optional[int] = None,
         additional_unimodal_data: Optional[Dict[str, list]] = None,
     ):
+        if n_random_subsample_train is not None:
+            self.n_random_subsample_train = n_random_subsample_train
+        if n_random_subsample_val is not None:
+            self.n_random_subsample_val = n_random_subsample_val
         # pre-compute the embeddings from both modalities
         # first embed the validation set since we're returning
         # the models for the training set
