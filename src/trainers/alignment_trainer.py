@@ -993,12 +993,12 @@ class AlignmentTrainer(Trainer):
                 logger.debug(f"LR finder complete. Using learning rate: {optimal_lr}")
                 self.config["training"]["learning_rate"] = optimal_lr
 
-        params = list(alignment_image.parameters()) + list(
-            alignment_text.parameters()
-        )
-        loss_params = [p for p in self.loss.parameters() if p.requires_grad]
-        if loss_params:
-            params += loss_params
+            params = list(alignment_image.parameters()) + list(
+                alignment_text.parameters()
+            )
+            loss_params = [p for p in self.loss.parameters() if p.requires_grad]
+            if loss_params:
+                params += loss_params
 
             optimizer = optimizer_cls(
                 params=params,
